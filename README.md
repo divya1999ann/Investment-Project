@@ -1,4 +1,6 @@
-# Investment Committee — Backend API
+# IntelliInvest 
+
+Make intelligent decisions from the financial analysis of the company you are interested in.
 
 Multi-agent AI financial analysis grounded in documents (RAG).  
 Built with **FastAPI · PostgreSQL · pgvector · OpenAI API**.
