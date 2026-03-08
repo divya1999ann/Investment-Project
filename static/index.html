@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IntelliInvest</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;700&family=Playfair+Display:wght@700;900&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #080808; color: #E8E0D0; font-family: 'IBM Plex Mono', 'Courier New', monospace; }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: #111; }
+    ::-webkit-scrollbar-thumb { background: #333; }
+    textarea { resize: vertical; }
+    @keyframes pulse  { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes spin   { to{transform:rotate(360deg)} }
+    .fade-in  { animation: fadeIn 0.45s ease forwards; }
+    .spinner  { display:inline-block;width:12px;height:12px;border:2px solid #333;border-top-color:#C8A96E;border-radius:50%;animation:spin 0.8s linear infinite; vertical-align:middle; }
+    .scanning::after { content:'█'; animation:pulse 0.8s infinite; }
+    .dot-pulse { animation: pulse 1.5s infinite; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    // All API calls go to the same origin — no CORS, no env vars needed
+    const api = {
+      async checkHealth() {
+        const res = await fetch('/health');
+        if (!res.ok) throw new Error('unreachable');
+        return res.json();
+      },
+      async ingestDocument({ ticker, raw_text, title }) {
+        const res = await fetch('/api/v1/documents/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ticker, raw_text, title }),
+        });
+        if (!res.ok) { const e = await res.json().catch(()=>({})); throw new Error(e.detail || 'Ingestion failed'); }
+        return res.json();
+      },
+      async runAnalysis(document_id) {
+        const res = await fetch('/api/v1/analysis/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ document_id }),
+        });
+        if (!res.ok) { const e = await res.json().catch(()=>({})); throw new Error(e.detail || 'Analysis failed'); }
+        return res.json();
+      },
+    };
+
+    const AGENTS = [
+      { id: 'graham', name: 'Benjamin Graham', title: 'Value Analyst',  color: '#C8A96E', accent: '#8B6914', icon: '◈' },
+      { id: 'wood',   name: 'Cathie Wood',     title: 'Growth Analyst', color: '#6EC8B8', accent: '#14897A', icon: '◉' },
+      { id: 'risk',   name: 'Risk Committee',  title: 'Risk Manager',   color: '#C86E6E', accent: '#891414', icon: '◎' },
+    ];
+
+    const SAMPLE_DOC = `Apple Inc. (AAPL) — Q4 FY2024 Earnings Summary
+
+Revenue: $94.9B (+6% YoY). Services revenue hit a record $24.2B (+12% YoY), now representing 25% of total revenue. iPhone revenue: $46.2B (+6% YoY).
+
+Gross margin: 46.2% — highest in company history, driven by Services mix-shift. Operating cash flow: $26.8B. Cash & equivalents: $156B. Net debt negative (net cash position of ~$49B after debt).
+
+Risks: China revenue declined 2% YoY to $15.0B amid intensifying competition from Huawei. Regulatory pressure in EU (DMA compliance costs). Dependence on iPhone (~49% of revenue).
+
+Forward guidance: Q1 FY2025 revenue growth "low to mid single digits." Management cited AI integration (Apple Intelligence) as a key growth catalyst for FY2025, with on-device LLM features rolling out across iPhone 16 lineup.
+
+Valuation: P/E ~31x (vs 5-yr avg 28x). PEG ratio ~2.8. EV/EBITDA ~24x. Dividend yield 0.44%. $110B buyback programme ongoing.`;
+
+    const ConvictionBar = ({ value, color }) => (
+      <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+        <div style={{ flex:1, height:4, background:'#1a1a1a', borderRadius:2, overflow:'hidden' }}>
+          <div style={{ width:`${(value/10)*100}%`, height:'100%', background:color, borderRadius:2, transition:'width 1.2s ease' }} />
+        </div>
+        <span style={{ color, fontSize:12, fontWeight:700, minWidth:28 }}>{value}/10</span>
+      </div>
+    );
+
+    const verdictColor = (v) => ({ BUY:'#4ADE80', SELL:'#F87171' }[v] || '#FBBF24');
+
+     function App() {
+      const [doc, setDoc]            = useState(SAMPLE_DOC);
+      const [ticker, setTicker]      = useState('AAPL');
+      const [phase, setPhase]        = useState('input');
+      const [health, setHealth]      = useState('checking');
+      const [statusMsg, setStatusMsg]= useState('');
+      const [docMeta, setDocMeta]    = useState(null);
+      const [session, setSession]    = useState(null);
+      const [activeAgent, setActive] = useState(null);
+      const [error, setError]        = useState(null);
+
+      useEffect(() => {
+        api.checkHealth().then(() => setHealth('ok')).catch(() => setHealth('err'));
+      }, []);
+
+      const runFullAnalysis = async () => {
+        if (!doc.trim() || !ticker.trim()) return;
+        setError(null); setDocMeta(null); setSession(null);
+
+        setPhase('ingesting');
+        setStatusMsg('Chunking document & generating embeddings via pgvector…');
+        let docResult;
+        try {
+          docResult = await api.ingestDocument({ ticker, raw_text: doc, title: `${ticker} Financial Document` });
+          setDocMeta(docResult);
+        } catch (e) { setError(`Ingestion failed: ${e.message}`); setPhase('input'); return; }
+
+        setPhase('analyzing');
+        setStatusMsg('Running 3 agents in parallel via FastAPI…');
+        try {
+          const s = await api.runAnalysis(docResult.id);
+          setSession(s); setPhase('results'); setActive(AGENTS[0].id);
+        } catch (e) { setError(`Analysis failed: ${e.message}`); setPhase('input'); }
+      };
+
+      const reset = () => { setPhase('input'); setSession(null); setDocMeta(null); setError(null); setActive(null); };
+
+      const agentMap = {};
+      if (session?.agent_analyses) session.agent_analyses.forEach(a => { agentMap[a.agent_id] = a.result || {}; });
+
+      return (
+        <div style={{ minHeight:'100vh', background:'#080808', paddingBottom:60 }}>
+
+          {/* Header */}
+          <div style={{ borderBottom:'2px solid #2a2a2a', padding:'22px 40px', display:'flex', alignItems:'center', justifyContent:'space-between', background:'#0a0a0a' }}>
+            <div>
+              <div style={{ fontFamily:"'Playfair Display',serif", fontSize:26, fontWeight:900, color:'#C8A96E', letterSpacing:1 }}>INTELLIINVEST</div>
+            </div>
+            <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+              <div className="dot-pulse" style={{ width:8, height:8, borderRadius:'50%', background: health==='ok' ? '#4ADE80' : health==='err' ? '#F87171' : '#FBBF24', boxShadow:`0 0 8px ${health==='ok'?'#4ADE80':health==='err'?'#F87171':'#FBBF24'}` }} />
+              <span style={{ fontSize:11, letterSpacing:2, color: health==='ok'?'#4ADE80':health==='err'?'#F87171':'#FBBF24', fontWeight:700 }}>
+                {health==='ok' ? '● API CONNECTED' : health==='err' ? '● API ERROR' : '● CONNECTING…'}
+              </span>
+            </div>
+          </div>
+
+          <div style={{ maxWidth:1100, margin:'0 auto', padding:'36px 24px' }}>
+
+            {error && (
+              <div style={{ marginBottom:20, padding:'13px 18px', border:'1px solid #F8717144', background:'#F8717108', borderRadius:2, fontSize:12, color:'#F87171' }}>⚠ {error}</div>
+            )}
+
+            {/* INPUT */}
+            {phase === 'input' && (
+              <div className="fade-in">
+                <div style={{ marginBottom:26 }}>
+                  <div style={{ fontSize:9, letterSpacing:4, color:'#444', marginBottom:6 }}>STEP 01 — SUBMIT DOCUMENT FOR ANALYSIS</div>
+                  <p style={{ color:'#484848', fontSize:12, lineHeight:1.7, maxWidth:560 }}>
+                    Paste any financial document. The backend chunks it, embeds it into pgvector, then runs 3 AI analysts grounded exclusively in that text.
+                  </p>
+                </div>
+
+                <div style={{ marginBottom:16 }}>
+                  <label style={{ display:'block', fontSize:9, letterSpacing:3, color:'#C8A96E', marginBottom:7 }}>TICKER</label>
+                  <input value={ticker} onChange={e => setTicker(e.target.value.toUpperCase())}
+                    style={{ background:'#0F0F0F', border:'1px solid #222', color:'#E8E0D0', padding:'10px 14px', fontFamily:'inherit', fontSize:15, fontWeight:700, letterSpacing:4, width:140, outline:'none', borderRadius:2 }} />
+                </div>
+
+                <div style={{ marginBottom:22 }}>
+                  <label style={{ display:'block', fontSize:9, letterSpacing:3, color:'#C8A96E', marginBottom:7 }}>FINANCIAL DOCUMENT</label>
+                  <textarea value={doc} onChange={e => setDoc(e.target.value)} rows={11}
+                    style={{ width:'100%', background:'#0F0F0F', border:'1px solid #222', color:'#888', padding:'14px', fontFamily:'inherit', fontSize:12, lineHeight:1.8, outline:'none', borderRadius:2 }} />
+                  <div style={{ fontSize:10, color:'#252525', marginTop:4 }}>
+                    {doc.split(/\s+/).filter(Boolean).length} words · ~{Math.ceil(doc.length/800)} chunks when indexed
+                  </div>
+                </div>
+
+                <div style={{ marginBottom:26 }}>
+                  <div style={{ fontSize:9, letterSpacing:3, color:'#2a2a2a', marginBottom:12 }}>ANALYSTS CONVENING</div>
+                  <div style={{ display:'flex', gap:10 }}>
+                    {AGENTS.map(a => (
+                      <div key={a.id} style={{ flex:1, padding:'12px 14px', border:`1px solid ${a.accent}2a`, borderRadius:2, background:`${a.accent}06` }}>
+                        <div style={{ fontSize:16, marginBottom:5 }}>{a.icon}</div>
+                        <div style={{ fontFamily:"'Playfair Display',serif", fontSize:12, color:a.color, fontWeight:700 }}>{a.name}</div>
+                        <div style={{ fontSize:9, color:'#3a3a3a', letterSpacing:1, marginTop:2 }}>{a.title.toUpperCase()}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <button onClick={runFullAnalysis} disabled={!doc.trim() || !ticker.trim()}
+                  style={{ background:'#C8A96E', color:'#080808', border:'none', padding:'13px 36px', fontFamily:'inherit', fontWeight:700, fontSize:11, letterSpacing:4, cursor:'pointer', opacity:(doc.trim()&&ticker.trim())?1:0.3, borderRadius:2 }}>
+                  CONVENE COMMITTEE →
+                </button>
+              </div>
+            )}
+
+            {/* INGESTING / ANALYZING */}
+            {(phase==='ingesting'||phase==='analyzing') && (
+              <div className="fade-in" style={{ textAlign:'center', padding:'60px 0' }}>
+                <div style={{ fontFamily:"'Playfair Display',serif", fontSize:26, color:'#C8A96E', marginBottom:6 }}>
+                  {phase==='ingesting' ? 'Indexing Document' : 'Committee in Session'}
+                </div>
+                <div style={{ color:'#404040', fontSize:10, letterSpacing:3, marginBottom:40 }}>{statusMsg}</div>
+
+                {[
+                  { label:'POST /api/v1/documents/ — chunk & embed',   done:phase==='analyzing', active:phase==='ingesting' },
+                  { label:'pgvector cosine similarity retrieval',       done:false,               active:phase==='analyzing' },
+                  { label:'3 agents run in parallel (asyncio.gather)',  done:false,               active:phase==='analyzing' },
+                  { label:'POST /api/v1/analysis/ — consensus verdict', done:false,               active:phase==='analyzing' },
+                ].map((step, i) => (
+                  <div key={i} style={{ display:'flex', alignItems:'center', gap:14, maxWidth:400, margin:'0 auto 12px', padding:'12px 18px', border:`1px solid ${step.done?'#1a2a1a':step.active?'#C8A96E22':'#111'}`, borderRadius:2, background:step.done?'#0d150d':'#0A0A0A' }}>
+                    <span style={{ fontSize:13, color:step.done?'#4ADE80':step.active?'#C8A96E':'#2a2a2a' }}>
+                      {step.done ? '✓' : step.active ? <span className="spinner" /> : '○'}
+                    </span>
+                    <span style={{ fontSize:10, color:step.done?'#4ADE80':step.active?'#C8A96E':'#2a2a2a', letterSpacing:1 }}>{step.label}</span>
+                  </div>
+                ))}
+
+                {phase==='analyzing' && (
+                  <div style={{ marginTop:28 }}>
+                    {AGENTS.map(a => (
+                      <div key={a.id} style={{ display:'flex', alignItems:'center', gap:12, maxWidth:400, margin:'0 auto 10px', padding:'10px 16px', border:`1px solid ${a.accent}2a`, borderRadius:2 }}>
+                        <span style={{ color:a.color }}>{a.icon}</span>
+                        <span style={{ fontSize:11, color:a.color }}>{a.name}</span>
+                        <span style={{ marginLeft:'auto', fontSize:9, color:'#444' }} className="scanning">ANALYSING </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* RESULTS */}
+            {phase==='results' && session && (
+              <div className="fade-in">
+                {docMeta && (
+                  <div style={{ display:'flex', flexWrap:'wrap', gap:8, marginBottom:22 }}>
+                    {[['DOC ID',docMeta.id.slice(0,8)+'…'],['CHUNKS',docMeta.chunk_count],['WORDS',docMeta.word_count],['SESSION',session.id.slice(0,8)+'…'],['STATUS',session.status.toUpperCase()]].map(([k,v]) => (
+                      <div key={k} style={{ padding:'5px 12px', background:'#0F0F0F', border:'1px solid #181818', borderRadius:2, fontSize:9, letterSpacing:1 }}>
+                        <span style={{ color:'#2a2a2a' }}>{k} </span><span style={{ color:'#555' }}>{v}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {session.consensus && (
+                  <div style={{ border:`2px solid ${verdictColor(session.committee_verdict)}`, background:`${verdictColor(session.committee_verdict)}08`, padding:'28px 32px', borderRadius:3, marginBottom:36, display:'flex', gap:32, alignItems:'flex-start' }}>
+                    <div style={{ minWidth:180 }}>
+                      <div style={{ fontSize:8, letterSpacing:4, color:'#555', marginBottom:12, fontWeight:700 }}>COMMITTEE VERDICT</div>
+                      <div style={{ fontFamily:"'Playfair Display',serif", fontSize:64, fontWeight:900, color:verdictColor(session.committee_verdict), lineHeight:1, marginBottom:16 }}>{session.committee_verdict}</div>
+                      <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+                        <span style={{ padding:'6px 12px', background:verdictColor(session.committee_verdict)+'22', border:`1px solid ${verdictColor(session.committee_verdict)}44`, color:verdictColor(session.committee_verdict), fontSize:10, letterSpacing:2, fontWeight:700, borderRadius:2, textAlign:'center' }}>{session.consensus.confidence} CONFIDENCE</span>
+                        <span style={{ padding:'6px 12px', background:'#1a1a1a', border:'1px solid #262626', color:'#888', fontSize:10, letterSpacing:2, fontWeight:700, borderRadius:2, textAlign:'center' }}>{session.consensus.agreement_level}</span>
+                      </div>
+                    </div>
+                    <div style={{ flex:1 }}>
+                      <div style={{ fontSize:9, letterSpacing:3, color:'#555', marginBottom:12, fontWeight:700 }}>COMMITTEE PERSPECTIVE</div>
+                      <p style={{ color:'#999', fontSize:14, lineHeight:2, margin:'0 0 18px' }}>{session.consensus.summary}</p>
+                      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
+                        <div style={{ padding:'14px', background:'#0d150d', border:'1px solid #1a2a1a', borderRadius:2 }}>
+                          <div style={{ fontSize:9, letterSpacing:3, color:'#4ADE80', marginBottom:8, fontWeight:700 }}>✦ KEY OPPORTUNITY</div>
+                          <div style={{ fontSize:12, color:'#7a9e7a', lineHeight:1.6 }}>{session.consensus.key_opportunity}</div>
+                        </div>
+                        <div style={{ padding:'14px', background:'#150d0d', border:'1px solid #2a1a1a', borderRadius:2 }}>
+                          <div style={{ fontSize:9, letterSpacing:3, color:'#F87171', marginBottom:8, fontWeight:700 }}>✦ KEY RISK</div>
+                          <div style={{ fontSize:12, color:'#9e7a7a', lineHeight:1.6 }}>{session.consensus.key_risk}</div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div style={{ marginBottom:20, marginTop:40 }}>
+                  <div style={{ fontSize:9, letterSpacing:4, color:'#555', marginBottom:14, fontWeight:700 }}>INDIVIDUAL ANALYST REPORTS</div>
+                  <div style={{ display:'flex', borderBottom:'2px solid #0F0F0F' }}>
+                    {AGENTS.map(a => (
+                      <button key={a.id} onClick={() => setActive(a.id)}
+                        style={{ padding:'12px 24px', background:'none', border:'none', borderBottom:activeAgent===a.id?`3px solid ${a.color}`:'3px solid transparent', color:activeAgent===a.id?a.color:'#2a2a2a', fontFamily:'inherit', fontSize:11, letterSpacing:2, cursor:'pointer', fontWeight:activeAgent===a.id?700:400, transition:'all 0.3s ease' }}>
+                        {a.icon} {a.name.split(' ')[0].toUpperCase()}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {activeAgent && (() => {
+                  const a = AGENTS.find(x => x.id===activeAgent);
+                  const r = agentMap[activeAgent] || {};
+                  if (r.error) return <div style={{ color:'#F87171', fontSize:12, padding:20 }}>⚠ {r.error}</div>;
+                  return (
+                    <div className="fade-in" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
+                      <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
+                        <div style={{ padding:20, border:`2px solid ${a.accent}`, borderRadius:3, background:`${a.accent}08` }}>
+                          <div style={{ fontSize:8, letterSpacing:4, color:a.color, marginBottom:14, fontWeight:700, opacity:0.8 }}>VERDICT & CONVICTION</div>
+                          <div style={{ marginBottom:16 }}>
+                            <span style={{ display:'inline-block', padding:'8px 24px', background:verdictColor(r.verdict)+'22', color:verdictColor(r.verdict), border:`2px solid ${verdictColor(r.verdict)}44`, fontSize:16, fontWeight:900, letterSpacing:4, borderRadius:2 }}>{r.verdict}</span>
+                          </div>
+                          <ConvictionBar value={r.conviction} color={a.color} />
+                          <p style={{ fontSize:13, color:'#888', marginTop:14, lineHeight:1.6 }}>{r.price_target_commentary}</p>
+                        </div>
+                        <div style={{ padding:20, borderLeft:`4px solid ${a.color}`, border:'2px solid #1a1a1a', borderRadius:3, background:'#0F0F0F' }}>
+                          <div style={{ fontSize:8, letterSpacing:4, color:'#555', marginBottom:10, fontWeight:700 }}>KEY DATA POINT FROM DOCUMENT</div>
+                          <div style={{ fontSize:14, color:a.color, lineHeight:1.8, fontStyle:'italic', fontWeight:500 }}>"{r.key_quote}"</div>
+                        </div>
+                      </div>
+                      <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
+                        <div style={{ padding:20, border:'2px solid #1a2a1a', borderRadius:3, background:'#0d150d' }}>
+                          <div style={{ fontSize:8, letterSpacing:4, color:'#4ADE80', marginBottom:10, fontWeight:700 }}>▲ BULL CASE</div>
+                          <p style={{ fontSize:13, color:'#7a9e7a', lineHeight:1.8, margin:0 }}>{r.bull_case}</p>
+                        </div>
+                        <div style={{ padding:20, border:'2px solid #2a1a1a', borderRadius:3, background:'#150d0d' }}>
+                          <div style={{ fontSize:8, letterSpacing:4, color:'#F87171', marginBottom:10, fontWeight:700 }}>▼ BEAR CASE</div>
+                          <p style={{ fontSize:13, color:'#9e7a7a', lineHeight:1.8, margin:0 }}>{r.bear_case}</p>
+                        </div>
+                        <div style={{ padding:20, border:`2px solid ${a.accent}33`, borderRadius:3, background:`${a.accent}05` }}>
+                          <div style={{ fontSize:8, letterSpacing:4, color:'#3a3a3a', marginBottom:10, fontWeight:700 }}>{a.icon} {a.name.toUpperCase()} — INVESTMENT THESIS</div>
+                          <p style={{ fontSize:13, color:'#888', lineHeight:1.8, margin:0 }}>{r.reasoning}</p>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                <div style={{ marginTop:36, borderTop:'1px solid #0F0F0F', paddingTop:22 }}>
+                  <button onClick={reset} style={{ background:'none', border:'1px solid #181818', color:'#333', padding:'10px 22px', fontFamily:'inherit', fontSize:10, letterSpacing:3, cursor:'pointer', borderRadius:2 }}>← NEW ANALYSIS</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
